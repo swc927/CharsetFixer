@@ -1,239 +1,170 @@
-const $ = (s) => document.querySelector(s);
-const encodings = ["utf-8", "gbk", "big5", "windows-1252"];
-
-const dropzone = $("#dropzone");
-const fileInput = $("#fileInput");
-const delimiterSel = $("#delimiter");
-const encodingOverrideSel = $("#encodingOverride");
-const outputFormatSel = $("#outputFormat");
-const downloadBtn = $("#downloadBtn");
-const summaryEl = $("#detectSummary");
-const tabsEl = $("#tabs");
-
-let current = {
-  file: null,
-  bytes: null,
-  results: [],
-  best: null,
-  activeEncoding: null,
-  parsed: null,
-};
-
-dropzone.addEventListener("dragover", (e) => {
-  e.preventDefault();
-  dropzone.classList.add("dragover");
-});
-dropzone.addEventListener("dragleave", () =>
-  dropzone.classList.remove("dragover")
-);
-dropzone.addEventListener("drop", (e) => {
-  e.preventDefault();
-  dropzone.classList.remove("dragover");
-  const f = e.dataTransfer.files[0];
-  if (f) handleFile(f);
-});
-fileInput.addEventListener("change", (e) => {
-  const f = e.target.files[0];
-  if (f) handleFile(f);
-});
-
-delimiterSel.addEventListener("change", () => {
-  if (current.activeEncoding) setActiveEncoding(current.activeEncoding);
-});
-encodingOverrideSel.addEventListener("change", () => {
-  if (!current.bytes) return;
-  const enc = encodingOverrideSel.value || current.best?.encoding;
-  setActiveEncoding(enc);
-});
-
-downloadBtn.addEventListener("click", () => {
-  if (!current.parsed) return;
-  const ext = outputFormatSel.value;
-  const rows = current.parsed;
-  const bom = new Uint8Array([0xef, 0xbb, 0xbf]);
-  const content =
-    ext === "csv" ? toCSV(rows) : rows.map((r) => r.join("\t")).join("\n");
-  const blob = new Blob([bom, content], {
-    type: ext === "csv" ? "text/csv;charset=utf-8" : "text/plain;charset=utf-8",
-  });
-  const a = document.createElement("a");
-  const base = current.file?.name?.replace(/\.[^.]+$/, "") || "fixed";
-  a.download = base + (ext === "csv" ? ".utf8.csv" : ".utf8.txt");
-  a.href = URL.createObjectURL(blob);
-  a.click();
-  a.remove();
-});
-
-async function handleFile(file) {
-  resetUI();
-  current.file = file;
-  const ab = await file.arrayBuffer();
-  current.bytes = new Uint8Array(ab);
-
-  const override = encodingOverrideSel.value;
-  const tryList = override ? [override] : encodings;
-  const results = [];
-  for (const enc of tryList) {
-    try {
-      const dec = new TextDecoder(enc, { fatal: false });
-      let text = dec.decode(current.bytes);
-      text = stripBOM(text);
-      const scoreInfo = scoreText(text);
-      results.push({
-        encoding: enc,
-        text,
-        score: scoreInfo.score,
-        reason: scoreInfo.reason,
-      });
-    } catch {}
+// Charset Fixer by SWC v2 with robust CSV parsing
+const el = (s) => document.querySelector(s);
+el("#processBtn").addEventListener("click", async () => {
+  const file = el("#fileInput").files[0];
+  if (!file) return alert("Please choose a CSV file first");
+  const flatten = el("#flatten").checked;
+  el("#status").textContent = "Reading file...";
+  const text = await readFileAsText(file, "utf-8");
+  el("#status").textContent = "Parsing CSV...";
+  const rows = parseCSV_RFC4180(text);
+  if (!rows || rows.length === 0) {
+    el("#status").textContent = "Parsed zero rows. Check the file.";
+    return;
   }
-  if (override) {
-    for (const enc of encodings) {
-      if (results.find((r) => r.encoding === enc)) continue;
-      try {
-        const dec = new TextDecoder(enc, { fatal: false });
-        let text = dec.decode(current.bytes);
-        text = stripBOM(text);
-        const scoreInfo = scoreText(text);
-        results.push({
-          encoding: enc,
-          text,
-          score: scoreInfo.score,
-          reason: scoreInfo.reason,
-        });
-      } catch {}
+  // First row is header
+  const header = rows[0];
+  const outRows = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const obj = {};
+    for (let j = 0; j < header.length; j++) {
+      obj[header[j]] = r[j] ?? "";
     }
+    outRows.push(obj);
   }
-
-  results.sort((a, b) => b.score - a.score);
-  current.results = results;
-  current.best = results[0];
-  summaryEl.textContent = `Best guess ${
-    current.best.encoding
-  }  score ${current.best.score.toFixed(2)}  ${current.best.reason}`;
-  renderTabs(
-    results.map((r) => r.encoding),
-    current.best.encoding
+  const csvText = toCSV(outRows, { flattenNewlines: flatten });
+  el("#status").textContent = "Encoding and downloading...";
+  downloadCSV(
+    safeName(file.name.replace(/\.csv$/i, "") + "_fixed.csv"),
+    csvText
   );
-  setActiveEncoding(current.best.encoding);
+  el("#status").textContent = "Done";
+});
+
+function safeName(name) {
+  return name.replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
-function stripBOM(t) {
-  return t.charCodeAt(0) === 0xfeff ? t.slice(1) : t;
-}
-
-function scoreText(text) {
-  const total = Math.max(text.length, 1);
-  const bad = (text.match(/\uFFFD/g) || []).length;
-  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  const punct = (text.match(/[，。、《》！（）【】：「」“”；：]/g) || [])
-    .length;
-  const ctrl = (text.match(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g) || []).length;
-  const score =
-    2 * (cjk / total) +
-    1 * (punct / total) -
-    3 * (bad / total) -
-    1.5 * (ctrl / total);
-  const reason = `${cjk} Chinese, ${bad} replacement, ${ctrl} control`;
-  return { score, reason };
-}
-
-function renderTabs(encs, active) {
-  tabsEl.innerHTML = "";
-  encs.forEach((enc) => {
-    const b = document.createElement("button");
-    b.className = "tab" + (enc === active ? " active" : "");
-    b.textContent = enc.toUpperCase();
-    b.onclick = () => setActiveEncoding(enc);
-    tabsEl.appendChild(b);
+function readFileAsText(file, encoding = "utf-8") {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => resolve(reader.result);
+    reader.readAsText(file, encoding);
   });
 }
 
-function setActiveEncoding(enc) {
-  current.activeEncoding = enc;
-  document
-    .querySelectorAll(".tab")
-    .forEach((t) =>
-      t.classList.toggle("active", t.textContent.toLowerCase() === enc)
-    );
-  const res = current.results.find((r) => r.encoding === enc);
-  if (!res) return;
-  const delim = chooseDelimiter(res.text, delimiterSel.value);
-  const rows = parseCSVLike(res.text, delim);
-  current.parsed = rows;
-  downloadBtn.disabled = false;
-}
-
-function chooseDelimiter(text, mode) {
-  if (mode !== "auto") return mode === "\t" ? "\t" : mode;
-  const sample = text.split(/\r?\n/).slice(0, 50).join("\n");
-  const counts = {
-    ",": (sample.match(/,/g) || []).length,
-    ";": (sample.match(/;/g) || []).length,
-    "\t": (sample.match(/\t/g) || []).length,
-    "|": (sample.match(/\|/g) || []).length,
-  };
-  let best = ",";
-  let bestCount = -1;
-  for (const [k, v] of Object.entries(counts)) {
-    if (v > bestCount) {
-      best = k;
-      bestCount = v;
-    }
-  }
-  return best === "\t" ? "\t" : best;
-}
-
-function parseCSVLike(text, delim) {
+/* Robust RFC4180 parser that handles quotes and newlines inside fields */
+function parseCSV_RFC4180(text) {
   const rows = [];
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  for (const line of lines) {
-    const row = [];
-    let cur = "";
-    let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQ && line[i + 1] === '"') {
-          cur += '"';
-          i++;
+  let field = "";
+  let row = [];
+  let i = 0;
+  let inQuotes = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        const next = text[i + 1];
+        if (next === '"') {
+          // escaped quote
+          field += '"';
+          i += 2;
+          continue;
         } else {
-          inQ = !inQ;
+          inQuotes = false;
+          i += 1;
+          continue;
         }
-      } else if (!inQ && ((delim === "\t" && ch === "\t") || ch === delim)) {
-        row.push(cur);
-        cur = "";
       } else {
-        cur += ch;
+        field += c;
+        i += 1;
+        continue;
+      }
+    } else {
+      if (c === '"') {
+        inQuotes = true;
+        i += 1;
+        continue;
+      } else if (c === ",") {
+        row.push(field);
+        field = "";
+        i += 1;
+        continue;
+      } else if (c === "\r") {
+        // look ahead for \n
+        row.push(field);
+        field = "";
+        rows.push(row);
+        row = [];
+        if (text[i + 1] === "\n") {
+          i += 2;
+        } else {
+          i += 1;
+        }
+        continue;
+      } else if (c === "\n") {
+        row.push(field);
+        field = "";
+        rows.push(row);
+        row = [];
+        i += 1;
+        continue;
+      } else {
+        field += c;
+        i += 1;
+        continue;
       }
     }
-    row.push(cur);
-    rows.push(row);
   }
+  // last field
+  row.push(field);
+  rows.push(row);
   return rows;
 }
 
-function toCSV(rows) {
-  return rows
-    .map((r) =>
-      r
-        .map((cell) => {
-          const s = String(cell ?? "");
-          if (/[",\n]/.test(s)) return '"' + s.replace(/\"/g, '\\"') + '"';
-          return s;
-        })
-        .join(",")
-    )
-    .join("\n");
+/* Normalise HTML and whitespace */
+function normaliseRichText(input) {
+  if (input == null) return "";
+  let s = String(input);
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/p\s*>/gi, "\n");
+  s = s.replace(/<p[^>]*>/gi, "");
+  s = s.replace(/<div[^>]*>/gi, "");
+  s = s.replace(/<\/div\s*>/gi, "\n");
+  s = s.replace(/\r?\n+/g, "\n");
+  return s.trim();
 }
 
-function resetUI() {
-  summaryEl.textContent = "";
-  tabsEl.innerHTML = "";
-  downloadBtn.disabled = true;
-  current.parsed = null;
+/* Escape for CSV fields */
+function csvEscape(field, opts = {}) {
+  let s = field == null ? "" : String(field);
+  if (opts.flattenNewlines) s = s.replace(/\r?\n/g, "; ");
+  if (s.includes('"')) s = s.replace(/"/g, '""');
+  if (/[",\r\n]/.test(s)) s = '"' + s + '"';
+  return s;
 }
 
-dropzone.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" || e.key === " ") fileInput.click();
-});
+/* Create CSV text from array of objects */
+function toCSV(rows, opts = {}) {
+  if (!Array.isArray(rows) || rows.length === 0) return "";
+  const header = Array.from(
+    rows.reduce((set, row) => {
+      Object.keys(row || {}).forEach((k) => set.add(k));
+      return set;
+    }, new Set())
+  );
+  const lines = [];
+  lines.push(header.map((h) => csvEscape(h, opts)).join(","));
+  for (const r of rows) {
+    const vals = header.map((key) =>
+      csvEscape(normaliseRichText(r[key]), opts)
+    );
+    lines.push(vals.join(","));
+  }
+  return lines.join("\r\n");
+}
+
+/* Download with UTF-8 BOM and CRLF */
+function downloadCSV(filename, csvText) {
+  const BOM = "\uFEFF";
+  const blob = new Blob([BOM + csvText], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename || "export.csv";
+  document.body.appendChild(a);
+  a.click();
+  URL.revokeObjectURL(a.href);
+  a.remove();
+}
